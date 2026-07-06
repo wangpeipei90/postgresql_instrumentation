@@ -22,7 +22,13 @@ pg_ctl -D /Users/peipeiwang/post_db/pgdata -l /Users/peipeiwang/post_db/pgdata/l
 createdb beauty_demo
 ```
 
-Server is already initialized and configured with `shared_preload_libraries = 'pg_duckdb,pg_mooncake'`.
+Server is already initialized and configured in `postgresql.conf` with:
+
+```
+shared_preload_libraries = 'pg_duckdb,pg_mooncake'   # pg_duckdb must come first
+wal_level = logical                                  # required by mooncake replication
+duckdb.allow_unsigned_extensions = true              # required for locally-built mooncake extension
+```
 
 ### Step 2: Convert JSONL to CSV
 
@@ -55,7 +61,10 @@ CREATE TABLE products (
     features       TEXT
 );
 
+-- Note: the SERIAL PRIMARY KEY is required — mooncake mirrors tables via
+-- logical replication, which needs a PK on every source table
 CREATE TABLE reviews (
+    id                SERIAL PRIMARY KEY,
     asin              TEXT,
     parent_asin       TEXT,
     user_id           TEXT,
@@ -69,7 +78,7 @@ CREATE TABLE reviews (
 
 -- Load data
 \copy products FROM '/Users/peipeiwang/post_db/products.csv' WITH (FORMAT csv, HEADER true);
-\copy reviews FROM '/Users/peipeiwang/post_db/reviews.csv' WITH (FORMAT csv, HEADER true);
+\copy reviews(asin, parent_asin, user_id, rating, review_title, review_text, review_timestamp, helpful_vote, verified_purchase) FROM '/Users/peipeiwang/post_db/reviews.csv' WITH (FORMAT csv, HEADER true);
 
 -- Add indexes
 CREATE INDEX idx_reviews_parent_asin ON reviews(parent_asin);
@@ -82,42 +91,35 @@ UNION ALL
 SELECT 'reviews', count(*) FROM reviews;
 ```
 
-### Step 4: Enable Extensions and Create Mooncake Columnstore Tables
+### Step 4: Enable Extensions and Create Mooncake Columnstore Mirrors
+
+Mooncake mirrors are **not** created with `CREATE TABLE ... USING mooncake` + `INSERT`
+(that pattern fails — the moonlink service never registers the table). Use the
+`mooncake.create_table(mirror, source)` procedure, which sets up a logical-replication
+mirror that stays in sync with the source table automatically:
 
 ```sql
 -- Enable extensions
 CREATE EXTENSION pg_duckdb;
 CREATE EXTENSION pg_mooncake;
 
--- Create columnstore copies using the 'mooncake' access method
-CREATE TABLE products_mooncake (
-    parent_asin    TEXT,
-    title          TEXT,
-    main_category  TEXT,
-    store          TEXT,
-    average_rating DOUBLE PRECISION,
-    rating_number  INTEGER,
-    price          DOUBLE PRECISION,
-    description    TEXT,
-    features       TEXT
-) USING mooncake;
+-- Create columnstore mirrors of the existing tables
+CALL mooncake.create_table('products_mooncake', 'products');
+CALL mooncake.create_table('reviews_mooncake', 'reviews');
 
-INSERT INTO products_mooncake SELECT * FROM products;
-
-CREATE TABLE reviews_mooncake (
-    asin              TEXT,
-    parent_asin       TEXT,
-    user_id           TEXT,
-    rating            DOUBLE PRECISION,
-    review_title      TEXT,
-    review_text       TEXT,
-    review_timestamp  BIGINT,
-    helpful_vote      INTEGER,
-    verified_purchase BOOLEAN
-) USING mooncake;
-
-INSERT INTO reviews_mooncake SELECT * FROM reviews;
+-- Verify
+SELECT * FROM mooncake.list_tables();
+SELECT 'products_mooncake' AS tbl, count(*) FROM products_mooncake
+UNION ALL
+SELECT 'reviews_mooncake', count(*) FROM reviews_mooncake;
 ```
+
+Constraints learned the hard way:
+- Every source table needs a PRIMARY KEY (hence the SERIAL PK on `reviews`)
+- Never add a `vector` column to a mirrored table — moonlink cannot replicate the
+  type and its metadata store gets corrupted. Keep embeddings in a separate,
+  unmirrored table (see `product_embeddings` in INSTALL_SUMMARY.md)
+- `wal_level = logical` must be set before creating mirrors
 
 ### Step 5: Example Queries — PostgreSQL Basics
 
@@ -249,3 +251,16 @@ CALL mooncake.optimize_table('products_mooncake', 'compact');
 - [ ] `products_mooncake` and `reviews_mooncake` have matching row counts
 - [ ] Analytics queries return identical results on heap vs columnstore tables
 - [ ] `\timing` shows performance difference on aggregations
+
+## Going Further
+
+The follow-on work builds on this demo — all documented in `INSTALL_SUMMARY.md`:
+
+1. **Vector search**: generate 384-dim embeddings (`generate_embeddings.py`), load into
+   a separate `product_embeddings` table, and build an HNSW index
+2. **HNSW trace instrumentation**: `SET hnsw.trace = on;` emits per-query JSON with
+   timing splits, graph-walk counters, page access patterns, buffer cache metrics,
+   and the ordered returned-TID list (see `pgvector/` and `patches/`)
+3. **Hybrid search**: mooncake columnstore pre-filters (price/rating/review
+   aggregations) combined with HNSW semantic ranking — including the planner
+   pitfalls that silently bypass the HNSW index
