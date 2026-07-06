@@ -1,0 +1,4 @@
+# name: test/sql/mooncake.test
+# description: test mooncake extension
+# group: [sql]
+

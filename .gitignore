@@ -1,9 +1,16 @@
-# Compiled PostgreSQL and extensions
+# Compiled binaries and database cluster (local-only)
 pgsql/
 pgdata/
-postgresql-18.4/
 postgresql-18.4.tar.bz2
-pg_mooncake/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.bc
+pg_mooncake/target/
+pg_mooncake/duckdb_mooncake/build/
 
 # macOS
 .DS_Store

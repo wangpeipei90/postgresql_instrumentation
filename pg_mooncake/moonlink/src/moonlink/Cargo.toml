@@ -1,0 +1,132 @@
+[package]
+name = "moonlink"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[[bin]]
+name = "profile_test"
+path = "src/bin/profile_test.rs"
+required-features = ["profile-test"]
+
+[features]
+default = ["storage-fs"]
+storage-all = ["storage-fs", "storage-s3", "storage-gcs"]
+test-utils = []
+
+storage-fs = ["opendal/services-fs", "iceberg/storage-fs"]
+storage-s3 = [
+    "opendal/services-s3",
+    "iceberg/storage-s3",
+    "base64",
+    "hmac",
+    "sha1",
+]
+
+# iceberg gcs io doesn't support HMAC key, so have to leverage S3 sdk.
+storage-gcs = [
+    "opendal/services-gcs",
+    "opendal/services-s3",
+    "iceberg/storage-gcs",
+    "iceberg/storage-s3",
+    "base64",
+    "hmac",
+    "sha1",
+]
+
+catalog-rest = ["iceberg-catalog-rest"]
+catalog-glue = ["iceberg-catalog-glue"]
+
+bench = []
+
+chaos-test = ["function_name"]
+profile-test = ["pprof", "function_name"]
+
+[dependencies]
+ahash = "0.8"
+anyhow = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+backon = { workspace = true }
+base64 = { version = "0.22", optional = true }
+bincode = { workspace = true }
+bitstream-io = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+crc32fast = { workspace = true }
+deltalake = { workspace = true }
+fastbloom = { workspace = true }
+function_name = { version = "0.3", optional = true }
+futures = { workspace = true }
+hashbrown = { workspace = true }
+hmac = { version = "0.12", optional = true }
+iceberg = { workspace = true }
+iceberg-catalog-glue = { workspace = true, optional = true }
+iceberg-catalog-rest = { workspace = true, optional = true }
+itertools = { workspace = true }
+lru = { workspace = true }
+memmap2 = "0.9"
+moka = { workspace = true }
+moonlink_error = { workspace = true }
+moonlink_proto = { workspace = true }
+moonlink_table_metadata = { workspace = true }
+more-asserts = { workspace = true }
+multimap = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+opendal = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+parquet = { workspace = true }
+pprof = { version = "0.15", features = ["flamegraph", "criterion"], optional = true }
+prost = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+roaring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { version = "0.10", optional = true }
+smallvec = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-bitstream-io = { workspace = true }
+tracing = { workspace = true }
+typed-builder = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+mockall = "0.13"
+pico-args = "0.5"
+rand = { workspace = true }
+rstest = { workspace = true }
+rstest_reuse = "0.7"
+tempfile = { workspace = true }
+
+[[bench]]
+name = "microbench_write_mooncake_table"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "microbench_index_stress"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "microbench_row_comparison"
+harness = false
+
+[[bench]]
+name = "bench_write"
+harness = false
+required-features = ["bench"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(profiling_enabled)'] }

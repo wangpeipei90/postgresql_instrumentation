@@ -1,0 +1,100 @@
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Zlib",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "bzip2-1.0.6",
+    "CC0-1.0",
+    "CDDL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    # Moonlink permission.
+    "LicenseRef-BSL-1.1",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+]
+
+[sources]
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/apache/iceberg-rust.git",
+    "https://github.com/Mooncake-Labs/rust-postgres.git?rev=14c8e599f5551a8caa96ff5023685a6f537a1455",
+]
+
+# TODO(hjiang): Cleanup these unmaintained crates.
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071", # rsa - marvin attack
+    "RUSTSEC-2024-0436", # paste - unmaintained
+]
+
+# TODO(hjiang): Resolve all duplicate dependencies.
+[bans]
+skip = [
+    { name = "apache-avro" },
+    { name = "axum" },
+    { name = "axum-core" },
+    { name = "base64" },
+    { name = "bitflags" },
+    { name = "bzip2" },
+    { name = "core-foundation" },
+    { name = "darling" },
+    { name = "darling_core" },
+    { name = "darling_macro" },
+    { name = "getrandom" },
+    { name = "h2" },
+    { name = "hashbrown" },
+    { name = "http" },
+    { name = "http-body" },
+    { name = "hyper" },
+    { name = "hyper-rustls" },
+    { name = "indexmap" },
+    { name = "itertools" },
+    { name = "linux-raw-sys" },
+    { name = "matchit" },
+    { name = "nix" },
+    { name = "ordered-float" },
+    { name = "petgraph" },
+    { name = "phf" },
+    { name = "phf_shared" },
+    { name = "prost-derive" },
+    { name = "quick-xml" },
+    { name = "rand" },
+    { name = "rand_chacha" },
+    { name = "rand_core" },
+    { name = "rustix" },
+    { name = "rustls" },
+    { name = "rustls-native-certs" },
+    { name = "rustls-pemfile" },
+    { name = "rustls-webpki" },
+    { name = "security-framework" },
+    { name = "spin" },
+    { name = "sqlparser" },
+    { name = "socket2" },
+    { name = "strum" },
+    { name = "strum_macros" },
+    { name = "tonic" },
+    { name = "thiserror" },
+    { name = "thiserror-impl" },
+    { name = "tokio-rustls" },
+    { name = "tower" },
+    { name = "typed-builder" },
+    { name = "typed-builder-macro" },
+    { name = "wasi" },
+    { name = "windows-sys" },
+    { name = "windows-targets" },
+    { name = "windows_aarch64_gnullvm" },
+    { name = "windows_aarch64_msvc" },
+    { name = "windows_i686_gnu" },
+    { name = "windows_i686_gnullvm" },
+    { name = "windows_i686_msvc" },
+    { name = "windows_x86_64_gnu" },
+    { name = "windows_x86_64_gnullvm" },
+    { name = "windows_x86_64_msvc" },
+]
