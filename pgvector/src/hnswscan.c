@@ -8,6 +8,7 @@
 #include "executor/instrument.h"
 #include "hnsw.h"
 #include "lib/pairingheap.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "pgstat.h"
@@ -130,6 +131,9 @@ ShowMemoryUsage(HnswScanOpaque so)
 /* Max distinct pages we track individually */
 #define HNSW_TRACE_MAX_PAGES 8192
 
+/* Max returned heap TIDs recorded for the topk_ids list */
+#define HNSW_TRACE_MAX_TIDS 1000
+
 static int64 hnsw_trace_query_counter = 0;
 
 /*
@@ -150,6 +154,9 @@ HnswTraceInit(HnswScanOpaque so)
 	t->neighbor_pages_capacity = HNSW_TRACE_MAX_PAGES;
 	t->neighbor_pages_seen = (BlockNumber *) MemoryContextAlloc(so->tmpCtx, sizeof(BlockNumber) * HNSW_TRACE_MAX_PAGES);
 
+	t->returned_tids_capacity = HNSW_TRACE_MAX_TIDS;
+	t->returned_tids = (ItemPointerData *) MemoryContextAlloc(so->tmpCtx, sizeof(ItemPointerData) * HNSW_TRACE_MAX_TIDS);
+
 	so->query_id = ++hnsw_trace_query_counter;
 
 	/* Snapshot backend-global buffer counters at scan start */
@@ -167,11 +174,34 @@ HnswTraceEmit(HnswScanOpaque so, int result_count)
 {
 	HnswTraceStats *t = &so->trace;
 	instr_time	now;
+	StringInfoData tids;
+	int			ntids;
 
 	INSTR_TIME_SET_CURRENT(now);
 	INSTR_TIME_SUBTRACT(now, t->scan_start);
 	t->latency_ms = INSTR_TIME_GET_MILLISEC(now);
-	t->hnsw_search_ms = t->latency_ms;
+
+	/* Time spent inside index AM calls vs the executor-side remainder */
+	t->hnsw_search_ms = INSTR_TIME_GET_MILLISEC(t->in_index_time);
+	t->heap_fetch_ms = t->latency_ms - t->hnsw_search_ms;
+	if (t->heap_fetch_ms < 0)
+		t->heap_fetch_ms = 0;
+
+	/* Ordered heap TIDs returned by the scan, as ctid strings */
+	initStringInfo(&tids);
+	appendStringInfoChar(&tids, '[');
+	ntids = Min(t->heap_fetch_count, (int64) t->returned_tids_capacity);
+	for (int i = 0; i < ntids; i++)
+	{
+		ItemPointer tid = &t->returned_tids[i];
+
+		if (i > 0)
+			appendStringInfoChar(&tids, ',');
+		appendStringInfo(&tids, "\"(%u,%u)\"",
+						 ItemPointerGetBlockNumber(tid),
+						 ItemPointerGetOffsetNumber(tid));
+	}
+	appendStringInfoChar(&tids, ']');
 
 	/* Snapshot backend-global buffer counters at scan end */
 	t->blks_hit_after = pgBufferUsage.shared_blks_hit;
@@ -190,6 +220,7 @@ HnswTraceEmit(HnswScanOpaque so, int result_count)
 		 "\"latency_ms\": %.3f, "
 		 "\"topk\": %d, "
 		 "\"hnsw_search_ms\": %.3f, "
+		 "\"heap_fetch_ms\": %.3f, "
 		 "\"distance_compute_count\": " INT64_FORMAT ", "
 		 "\"visited_nodes\": " INT64_FORMAT ", "
 		 "\"heap_fetch_count\": " INT64_FORMAT ", "
@@ -206,12 +237,14 @@ HnswTraceEmit(HnswScanOpaque so, int result_count)
 		 "\"idx_blks_hit\": " INT64_FORMAT ", "
 		 "\"idx_blks_read\": " INT64_FORMAT ", "
 		 "\"heap_blks_hit\": " INT64_FORMAT ", "
-		 "\"heap_blks_read\": " INT64_FORMAT
+		 "\"heap_blks_read\": " INT64_FORMAT ", "
+		 "\"topk_ids\": %s"
 		 "}",
 		 so->query_id,
 		 t->latency_ms,
 		 result_count,
 		 t->hnsw_search_ms,
+		 t->heap_fetch_ms,
 		 t->distance_compute_count,
 		 t->visited_nodes,
 		 t->heap_fetch_count,
@@ -228,7 +261,10 @@ HnswTraceEmit(HnswScanOpaque so, int result_count)
 		 t->idx_blks_hit,
 		 t->idx_blks_read,
 		 t->heap_blks_hit,
-		 t->heap_blks_read);
+		 t->heap_blks_read,
+		 tids.data);
+
+	pfree(tids.data);
 }
 
 /*
@@ -303,15 +339,20 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
 	int64		entryBlksHit = 0;
 	int64		entryBlksRead = 0;
+	instr_time	entryTime;
+
+	INSTR_TIME_SET_ZERO(entryTime);
 
 	/*
 	 * All buffer access inside the index AM is index pages, so the
-	 * per-call pgBufferUsage delta gives exact idx_blks_* counts.
+	 * per-call pgBufferUsage delta gives exact idx_blks_* counts. The
+	 * per-call time delta sums to hnsw_search_ms.
 	 */
 	if (hnsw_trace_enabled)
 	{
 		entryBlksHit = pgBufferUsage.shared_blks_hit;
 		entryBlksRead = pgBufferUsage.shared_blks_read;
+		INSTR_TIME_SET_CURRENT(entryTime);
 	}
 
 	/*
@@ -442,9 +483,15 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 		if (hnsw_trace_enabled)
 		{
+			instr_time	exitTime;
+
+			if (so->trace.heap_fetch_count < so->trace.returned_tids_capacity)
+				so->trace.returned_tids[so->trace.heap_fetch_count] = *heaptid;
 			so->trace.heap_fetch_count++;
 			so->trace.idx_blks_hit += pgBufferUsage.shared_blks_hit - entryBlksHit;
 			so->trace.idx_blks_read += pgBufferUsage.shared_blks_read - entryBlksRead;
+			INSTR_TIME_SET_CURRENT(exitTime);
+			INSTR_TIME_ACCUM_DIFF(so->trace.in_index_time, exitTime, entryTime);
 		}
 
 		MemoryContextSwitchTo(oldCtx);
@@ -457,8 +504,12 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 	if (hnsw_trace_enabled)
 	{
+		instr_time	exitTime;
+
 		so->trace.idx_blks_hit += pgBufferUsage.shared_blks_hit - entryBlksHit;
 		so->trace.idx_blks_read += pgBufferUsage.shared_blks_read - entryBlksRead;
+		INSTR_TIME_SET_CURRENT(exitTime);
+		INSTR_TIME_ACCUM_DIFF(so->trace.in_index_time, exitTime, entryTime);
 	}
 
 	MemoryContextSwitchTo(oldCtx);

@@ -1,7 +1,7 @@
 From e1408a5b95c4326c6516d78cb5a878b299320067 Mon Sep 17 00:00:00 2001
 From: Peipei Wang <pewang@confluent.io>
 Date: Sun, 5 Jul 2026 16:34:35 -0700
-Subject: [PATCH 2/2] Add buffer cache metrics to HNSW trace via pgBufferUsage
+Subject: [PATCH 2/3] Add buffer cache metrics to HNSW trace via pgBufferUsage
  snapshots
 
 Reports blks_hit/read_before/after (backend-global pgBufferUsage

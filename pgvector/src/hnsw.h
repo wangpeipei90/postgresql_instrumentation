@@ -65,8 +65,15 @@ typedef struct HnswTraceStats
 	BlockNumber *neighbor_pages_seen;
 	int			neighbor_pages_capacity;
 
+	/* Ordered heap TIDs returned by the scan, for baseline comparison */
+	ItemPointerData *returned_tids;
+	int			returned_tids_capacity;
+
 	/* Latency timer */
 	instr_time	scan_start;
+
+	/* Time accumulated inside index AM calls */
+	instr_time	in_index_time;
 }			HnswTraceStats;
 
 #if PG_VERSION_NUM >= 190000

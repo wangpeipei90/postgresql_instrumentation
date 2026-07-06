@@ -141,8 +141,10 @@ The pair shows cache warming directly: identical traversal (172 nodes, 218 total
 |-------|-------------|
 | `query_id` | Monotonic query counter for paired comparison |
 | `latency_ms` | End-to-end query time |
-| `topk` | Number of results returned |
-| `hnsw_search_ms` | HNSW index traversal + distance computation time |
+| `topk` | Number of TIDs the scan returned (with a filter above the scan, this is the over-fetch count, not the final LIMIT) |
+| `hnsw_search_ms` | Time inside index AM calls only: HNSW traversal + distance computation (per-call `instr_time` deltas, same bracketing as `idx_blks_*`) |
+| `heap_fetch_ms` | Derived: `latency_ms - hnsw_search_ms`. Executor-side time between index calls: heap fetches, filter quals, other plan nodes |
+| `topk_ids` | Ordered heap TIDs (`ctid` strings) returned by the scan, capped at 1000 — for recall/baseline comparison against an exact scan |
 | `distance_compute_count` | Number of distance function calls |
 | `visited_nodes` | HNSW graph nodes expanded during search |
 | `heap_fetch_count` | Heap tuple fetches (result rows) |
