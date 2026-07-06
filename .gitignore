@@ -1,0 +1,13 @@
+# Compiled PostgreSQL and extensions
+pgsql/
+pgdata/
+postgresql-18.4/
+postgresql-18.4.tar.bz2
+pgvector/
+pg_mooncake/
+
+# Generated data files
+products.csv
+reviews.csv
+product_embeddings.csv
+trace_output.json
