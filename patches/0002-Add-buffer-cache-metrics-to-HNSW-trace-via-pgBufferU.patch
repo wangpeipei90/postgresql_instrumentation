@@ -1,0 +1,151 @@
+From e1408a5b95c4326c6516d78cb5a878b299320067 Mon Sep 17 00:00:00 2001
+From: Peipei Wang <pewang@confluent.io>
+Date: Sun, 5 Jul 2026 16:34:35 -0700
+Subject: [PATCH 2/2] Add buffer cache metrics to HNSW trace via pgBufferUsage
+ snapshots
+
+Reports blks_hit/read_before/after (backend-global pgBufferUsage
+snapshots at scan start/end), exact idx_blks_hit/read (deltas
+accumulated inside each hnswgettuple call, where all buffer access
+is index pages), and derived heap_blks_hit/read as the remainder,
+which also absorbs other plan nodes running between index AM calls.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/hnsw.h     | 10 +++++++---
+ src/hnswscan.c | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 54 insertions(+), 3 deletions(-)
+
+diff --git a/src/hnsw.h b/src/hnsw.h
+index 11af3e0..826f9c2 100644
+--- a/src/hnsw.h
++++ b/src/hnsw.h
+@@ -49,10 +49,14 @@ typedef struct HnswTraceStats
+ 	int64		index_neighbor_distinct_pages;
+ 	BlockNumber last_neighbor_page;
+ 
+-	/* Buffer cache stats (snapshot deltas) */
+-	int64		idx_blks_hit;
++	/* Buffer cache stats from pgBufferUsage */
++	int64		blks_hit_before;	/* snapshot at scan start */
++	int64		blks_read_before;
++	int64		blks_hit_after; /* snapshot at scan end */
++	int64		blks_read_after;
++	int64		idx_blks_hit;	/* accumulated inside index AM calls (exact) */
+ 	int64		idx_blks_read;
+-	int64		heap_blks_hit;
++	int64		heap_blks_hit;	/* (after - before) - idx: heap + other nodes */
+ 	int64		heap_blks_read;
+ 
+ 	/* For page-run tracking: simple hash using bitmap */
+diff --git a/src/hnswscan.c b/src/hnswscan.c
+index 024cd1d..ddd9cb3 100644
+--- a/src/hnswscan.c
++++ b/src/hnswscan.c
+@@ -5,6 +5,7 @@
+ #include "access/genam.h"
+ #include "access/relscan.h"
+ #include "catalog/pg_class.h"
++#include "executor/instrument.h"
+ #include "hnsw.h"
+ #include "lib/pairingheap.h"
+ #include "miscadmin.h"
+@@ -151,6 +152,10 @@ HnswTraceInit(HnswScanOpaque so)
+ 
+ 	so->query_id = ++hnsw_trace_query_counter;
+ 
++	/* Snapshot backend-global buffer counters at scan start */
++	t->blks_hit_before = pgBufferUsage.shared_blks_hit;
++	t->blks_read_before = pgBufferUsage.shared_blks_read;
++
+ 	INSTR_TIME_SET_CURRENT(t->scan_start);
+ }
+ 
+@@ -168,6 +173,18 @@ HnswTraceEmit(HnswScanOpaque so, int result_count)
+ 	t->latency_ms = INSTR_TIME_GET_MILLISEC(now);
+ 	t->hnsw_search_ms = t->latency_ms;
+ 
++	/* Snapshot backend-global buffer counters at scan end */
++	t->blks_hit_after = pgBufferUsage.shared_blks_hit;
++	t->blks_read_after = pgBufferUsage.shared_blks_read;
++
++	/*
++	 * idx_blks_* are accumulated exactly inside hnswgettuple. The remainder
++	 * of the scan-window delta is heap fetches plus any other plan nodes
++	 * that ran between index AM calls.
++	 */
++	t->heap_blks_hit = (t->blks_hit_after - t->blks_hit_before) - t->idx_blks_hit;
++	t->heap_blks_read = (t->blks_read_after - t->blks_read_before) - t->idx_blks_read;
++
+ 	elog(INFO, "HNSW_TRACE: {"
+ 		 "\"query_id\": " INT64_FORMAT ", "
+ 		 "\"latency_ms\": %.3f, "
+@@ -182,6 +199,10 @@ HnswTraceEmit(HnswScanOpaque so, int result_count)
+ 		 "\"index_neighbor_loads\": " INT64_FORMAT ", "
+ 		 "\"index_neighbor_page_runs\": " INT64_FORMAT ", "
+ 		 "\"index_neighbor_distinct_pages\": " INT64_FORMAT ", "
++		 "\"blks_hit_before\": " INT64_FORMAT ", "
++		 "\"blks_hit_after\": " INT64_FORMAT ", "
++		 "\"blks_read_before\": " INT64_FORMAT ", "
++		 "\"blks_read_after\": " INT64_FORMAT ", "
+ 		 "\"idx_blks_hit\": " INT64_FORMAT ", "
+ 		 "\"idx_blks_read\": " INT64_FORMAT ", "
+ 		 "\"heap_blks_hit\": " INT64_FORMAT ", "
+@@ -200,6 +221,10 @@ HnswTraceEmit(HnswScanOpaque so, int result_count)
+ 		 t->index_neighbor_loads,
+ 		 t->index_neighbor_page_runs,
+ 		 t->index_neighbor_distinct_pages,
++		 t->blks_hit_before,
++		 t->blks_hit_after,
++		 t->blks_read_before,
++		 t->blks_read_after,
+ 		 t->idx_blks_hit,
+ 		 t->idx_blks_read,
+ 		 t->heap_blks_hit,
+@@ -276,6 +301,18 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+ {
+ 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+ 	MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
++	int64		entryBlksHit = 0;
++	int64		entryBlksRead = 0;
++
++	/*
++	 * All buffer access inside the index AM is index pages, so the
++	 * per-call pgBufferUsage delta gives exact idx_blks_* counts.
++	 */
++	if (hnsw_trace_enabled)
++	{
++		entryBlksHit = pgBufferUsage.shared_blks_hit;
++		entryBlksRead = pgBufferUsage.shared_blks_read;
++	}
+ 
+ 	/*
+ 	 * Index can be used to scan backward, but Postgres doesn't support
+@@ -404,7 +441,11 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+ 		}
+ 
+ 		if (hnsw_trace_enabled)
++		{
+ 			so->trace.heap_fetch_count++;
++			so->trace.idx_blks_hit += pgBufferUsage.shared_blks_hit - entryBlksHit;
++			so->trace.idx_blks_read += pgBufferUsage.shared_blks_read - entryBlksRead;
++		}
+ 
+ 		MemoryContextSwitchTo(oldCtx);
+ 
+@@ -414,6 +455,12 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+ 		return true;
+ 	}
+ 
++	if (hnsw_trace_enabled)
++	{
++		so->trace.idx_blks_hit += pgBufferUsage.shared_blks_hit - entryBlksHit;
++		so->trace.idx_blks_read += pgBufferUsage.shared_blks_read - entryBlksRead;
++	}
++
+ 	MemoryContextSwitchTo(oldCtx);
+ 	return false;
+ }
+-- 
+2.50.1 (Apple Git-155)
+

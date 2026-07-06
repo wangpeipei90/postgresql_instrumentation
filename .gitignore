@@ -3,8 +3,10 @@ pgsql/
 pgdata/
 postgresql-18.4/
 postgresql-18.4.tar.bz2
-pgvector/
 pg_mooncake/
+
+# macOS
+.DS_Store
 
 # Generated data files
 products.csv

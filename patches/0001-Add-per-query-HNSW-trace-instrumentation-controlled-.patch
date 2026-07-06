@@ -1,0 +1,521 @@
+From aa72d37f754f8c959e90d9044231280cba0102e0 Mon Sep 17 00:00:00 2001
+From: Peipei Wang <pewang@confluent.io>
+Date: Sun, 5 Jul 2026 15:12:44 -0700
+Subject: [PATCH 1/2] Add per-query HNSW trace instrumentation controlled by
+ hnsw.trace GUC
+
+Instruments pgvector's HNSW index scan to emit detailed per-query
+metrics as JSON via elog(INFO) when SET hnsw.trace = on. Tracks:
+distance_compute_count, visited_nodes, heap_fetch_count,
+index element/neighbor page loads, page runs, distinct pages,
+and end-to-end latency. Non-scan paths (build, insert, vacuum)
+pass NULL trace and are unaffected.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/hnsw.c       | 57 ++++++++++++++++++++++++++++
+ src/hnsw.h       | 58 +++++++++++++++++++++++++++--
+ src/hnswinsert.c |  2 +-
+ src/hnswscan.c   | 97 ++++++++++++++++++++++++++++++++++++++++++++++--
+ src/hnswutils.c  | 37 +++++++++++++-----
+ 5 files changed, 233 insertions(+), 18 deletions(-)
+
+diff --git a/src/hnsw.c b/src/hnsw.c
+index a3f5822..e3dffed 100644
+--- a/src/hnsw.c
++++ b/src/hnsw.c
+@@ -37,8 +37,61 @@ int			hnsw_iterative_scan;
+ int			hnsw_max_scan_tuples;
+ double		hnsw_scan_mem_multiplier;
+ int			hnsw_lock_tranche_id;
++bool		hnsw_trace_enabled;
+ static relopt_kind hnsw_relopt_kind;
+ 
++/*
++ * Track distinct element pages accessed during scan
++ */
++void
++HnswTraceRecordElementPage(HnswTraceStats * trace, BlockNumber blkno)
++{
++	if (trace == NULL)
++		return;
++
++	trace->index_element_loads++;
++
++	/* Track page runs: a new run starts when page differs from last */
++	if (trace->index_element_loads == 1 || blkno != trace->last_element_page)
++		trace->index_element_page_runs++;
++	trace->last_element_page = blkno;
++
++	/* Track distinct pages via linear scan of small array */
++	for (int i = 0; i < trace->index_element_distinct_pages; i++)
++	{
++		if (trace->element_pages_seen[i] == blkno)
++			return;
++	}
++	if (trace->index_element_distinct_pages < trace->element_pages_capacity)
++		trace->element_pages_seen[trace->index_element_distinct_pages] = blkno;
++	trace->index_element_distinct_pages++;
++}
++
++/*
++ * Track distinct neighbor pages accessed during scan
++ */
++void
++HnswTraceRecordNeighborPage(HnswTraceStats * trace, BlockNumber blkno)
++{
++	if (trace == NULL)
++		return;
++
++	trace->index_neighbor_loads++;
++
++	if (trace->index_neighbor_loads == 1 || blkno != trace->last_neighbor_page)
++		trace->index_neighbor_page_runs++;
++	trace->last_neighbor_page = blkno;
++
++	for (int i = 0; i < trace->index_neighbor_distinct_pages; i++)
++	{
++		if (trace->neighbor_pages_seen[i] == blkno)
++			return;
++	}
++	if (trace->index_neighbor_distinct_pages < trace->neighbor_pages_capacity)
++		trace->neighbor_pages_seen[trace->index_neighbor_distinct_pages] = blkno;
++	trace->index_neighbor_distinct_pages++;
++}
++
+ /*
+  * Assign a tranche ID for our LWLocks. This only needs to be done by one
+  * backend, as the tranche ID is remembered in shared memory.
+@@ -108,6 +161,10 @@ HnswInit(void)
+ 							 NULL, &hnsw_scan_mem_multiplier,
+ 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+ 
++	DefineCustomBoolVariable("hnsw.trace", "Enables detailed per-query trace output for HNSW scans",
++							  NULL, &hnsw_trace_enabled,
++							  false, PGC_USERSET, 0, NULL, NULL, NULL);
++
+ 	MarkGUCPrefixReserved("hnsw");
+ }
+ 
+diff --git a/src/hnsw.h b/src/hnsw.h
+index 08293be..11af3e0 100644
+--- a/src/hnsw.h
++++ b/src/hnsw.h
+@@ -18,9 +18,52 @@
+ #include "utils/sampling.h"
+ #include "vector.h"
+ 
+-#ifdef HNSW_BENCH
+ #include "portability/instr_time.h"
+-#endif
++
++/* Trace stats collected per scan */
++typedef struct HnswTraceStats
++{
++	/* Timing (milliseconds) */
++	double		hnsw_search_ms;
++	double		heap_fetch_ms;
++	double		filter_ms;
++	double		materialize_ms;
++	double		rerank_ms;
++	double		wait_ms;
++	double		latency_ms;
++
++	/* Counters */
++	int64		distance_compute_count;
++	int64		visited_nodes;
++	int64		heap_fetch_count;
++
++	/* Index page access - element tuples */
++	int64		index_element_loads;
++	int64		index_element_page_runs;
++	int64		index_element_distinct_pages;
++	BlockNumber last_element_page;
++
++	/* Index page access - neighbor tuples */
++	int64		index_neighbor_loads;
++	int64		index_neighbor_page_runs;
++	int64		index_neighbor_distinct_pages;
++	BlockNumber last_neighbor_page;
++
++	/* Buffer cache stats (snapshot deltas) */
++	int64		idx_blks_hit;
++	int64		idx_blks_read;
++	int64		heap_blks_hit;
++	int64		heap_blks_read;
++
++	/* For page-run tracking: simple hash using bitmap */
++	BlockNumber *element_pages_seen;
++	int			element_pages_capacity;
++	BlockNumber *neighbor_pages_seen;
++	int			neighbor_pages_capacity;
++
++	/* Latency timer */
++	instr_time	scan_start;
++}			HnswTraceStats;
+ 
+ #if PG_VERSION_NUM >= 190000
+ typedef Pointer Item;
+@@ -142,6 +185,7 @@ extern int	hnsw_iterative_scan;
+ extern int	hnsw_max_scan_tuples;
+ extern double hnsw_scan_mem_multiplier;
+ extern int	hnsw_lock_tranche_id;
++extern bool	hnsw_trace_enabled;
+ 
+ typedef enum HnswIterativeScanMode
+ {
+@@ -407,6 +451,10 @@ typedef struct HnswScanOpaqueData
+ 
+ 	/* Support functions */
+ 	HnswSupport support;
++
++	/* Trace instrumentation */
++	HnswTraceStats trace;
++	int64		query_id;
+ }			HnswScanOpaqueData;
+ 
+ typedef HnswScanOpaqueData * HnswScanOpaque;
+@@ -447,7 +495,9 @@ bool		HnswCheckNorm(HnswSupport * support, Datum value);
+ Buffer		HnswNewBuffer(Relation index, ForkNumber forkNum);
+ void		HnswInitPage(Buffer buf, Page page);
+ void		HnswInit(void);
+-List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples);
++List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, HnswTraceStats * trace);
++void		HnswTraceRecordElementPage(HnswTraceStats * trace, BlockNumber blkno);
++void		HnswTraceRecordNeighborPage(HnswTraceStats * trace, BlockNumber blkno);
+ HnswElement HnswGetEntryPoint(Relation index);
+ void		HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint);
+ void	   *HnswAlloc(HnswAllocator * allocator, Size size);
+@@ -467,7 +517,7 @@ void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Rela
+ bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
+ void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
+ void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
+-bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
++bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc, HnswTraceStats * trace);
+ void		HnswInitLockTranche(void);
+ const		HnswTypeInfo *HnswGetTypeInfo(Relation index);
+ PGDLLEXPORT void HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc);
+diff --git a/src/hnswinsert.c b/src/hnswinsert.c
+index 08ff27e..96cdb81 100644
+--- a/src/hnswinsert.c
++++ b/src/hnswinsert.c
+@@ -356,7 +356,7 @@ HnswLoadNeighbors(HnswElement element, Relation index, int m, int lm, int lc)
+ 	HnswNeighborArray *neighbors = HnswInitNeighborArray(lm, NULL);
+ 	ItemPointerData indextids[HNSW_MAX_M * 2];
+ 
+-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
++	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc, NULL))
+ 		return neighbors;
+ 
+ 	for (int i = 0; i < lm; i++)
+diff --git a/src/hnswscan.c b/src/hnswscan.c
+index 32cdb7d..024cd1d 100644
+--- a/src/hnswscan.c
++++ b/src/hnswscan.c
+@@ -4,11 +4,13 @@
+ 
+ #include "access/genam.h"
+ #include "access/relscan.h"
++#include "catalog/pg_class.h"
+ #include "hnsw.h"
+ #include "lib/pairingheap.h"
+ #include "miscadmin.h"
+ #include "nodes/pg_list.h"
+ #include "pgstat.h"
++#include "portability/instr_time.h"
+ #include "storage/lmgr.h"
+ #include "utils/float.h"
+ #include "utils/memutils.h"
+@@ -48,11 +50,11 @@ GetScanItems(IndexScanDesc scan, Datum value)
+ 
+ 	for (int lc = entryPoint->level; lc >= 1; lc--)
+ 	{
+-		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL);
++		w = HnswSearchLayer(base, q, ep, 1, lc, index, support, m, false, NULL, NULL, NULL, true, NULL, hnsw_trace_enabled ? &so->trace : NULL);
+ 		ep = w;
+ 	}
+ 
+-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples);
++	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, hnsw_trace_enabled ? &so->trace : NULL);
+ }
+ 
+ /*
+@@ -83,7 +85,7 @@ ResumeScanItems(IndexScanDesc scan)
+ 		ep = lappend(ep, sc);
+ 	}
+ 
+-	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
++	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples, hnsw_trace_enabled ? &so->trace : NULL);
+ }
+ 
+ /*
+@@ -124,6 +126,86 @@ ShowMemoryUsage(HnswScanOpaque so)
+ }
+ #endif
+ 
++/* Max distinct pages we track individually */
++#define HNSW_TRACE_MAX_PAGES 8192
++
++static int64 hnsw_trace_query_counter = 0;
++
++/*
++ * Initialize trace stats for a new scan
++ */
++static void
++HnswTraceInit(HnswScanOpaque so)
++{
++	HnswTraceStats *t = &so->trace;
++
++	memset(t, 0, sizeof(HnswTraceStats));
++	t->last_element_page = InvalidBlockNumber;
++	t->last_neighbor_page = InvalidBlockNumber;
++
++	t->element_pages_capacity = HNSW_TRACE_MAX_PAGES;
++	t->element_pages_seen = (BlockNumber *) MemoryContextAlloc(so->tmpCtx, sizeof(BlockNumber) * HNSW_TRACE_MAX_PAGES);
++
++	t->neighbor_pages_capacity = HNSW_TRACE_MAX_PAGES;
++	t->neighbor_pages_seen = (BlockNumber *) MemoryContextAlloc(so->tmpCtx, sizeof(BlockNumber) * HNSW_TRACE_MAX_PAGES);
++
++	so->query_id = ++hnsw_trace_query_counter;
++
++	INSTR_TIME_SET_CURRENT(t->scan_start);
++}
++
++/*
++ * Emit trace stats as JSON via elog(INFO)
++ */
++static void
++HnswTraceEmit(HnswScanOpaque so, int result_count)
++{
++	HnswTraceStats *t = &so->trace;
++	instr_time	now;
++
++	INSTR_TIME_SET_CURRENT(now);
++	INSTR_TIME_SUBTRACT(now, t->scan_start);
++	t->latency_ms = INSTR_TIME_GET_MILLISEC(now);
++	t->hnsw_search_ms = t->latency_ms;
++
++	elog(INFO, "HNSW_TRACE: {"
++		 "\"query_id\": " INT64_FORMAT ", "
++		 "\"latency_ms\": %.3f, "
++		 "\"topk\": %d, "
++		 "\"hnsw_search_ms\": %.3f, "
++		 "\"distance_compute_count\": " INT64_FORMAT ", "
++		 "\"visited_nodes\": " INT64_FORMAT ", "
++		 "\"heap_fetch_count\": " INT64_FORMAT ", "
++		 "\"index_element_loads\": " INT64_FORMAT ", "
++		 "\"index_element_page_runs\": " INT64_FORMAT ", "
++		 "\"index_element_distinct_pages\": " INT64_FORMAT ", "
++		 "\"index_neighbor_loads\": " INT64_FORMAT ", "
++		 "\"index_neighbor_page_runs\": " INT64_FORMAT ", "
++		 "\"index_neighbor_distinct_pages\": " INT64_FORMAT ", "
++		 "\"idx_blks_hit\": " INT64_FORMAT ", "
++		 "\"idx_blks_read\": " INT64_FORMAT ", "
++		 "\"heap_blks_hit\": " INT64_FORMAT ", "
++		 "\"heap_blks_read\": " INT64_FORMAT
++		 "}",
++		 so->query_id,
++		 t->latency_ms,
++		 result_count,
++		 t->hnsw_search_ms,
++		 t->distance_compute_count,
++		 t->visited_nodes,
++		 t->heap_fetch_count,
++		 t->index_element_loads,
++		 t->index_element_page_runs,
++		 t->index_element_distinct_pages,
++		 t->index_neighbor_loads,
++		 t->index_neighbor_page_runs,
++		 t->index_neighbor_distinct_pages,
++		 t->idx_blks_hit,
++		 t->idx_blks_read,
++		 t->heap_blks_hit,
++		 t->heap_blks_read);
++}
++
+ /*
+  * Prepare for an index scan
+  */
+@@ -176,6 +258,9 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
+ 	so->previousDistance = -get_float8_infinity();
+ 	MemoryContextReset(so->tmpCtx);
+ 
++	if (hnsw_trace_enabled)
++		HnswTraceInit(so);
++
+ 	if (keys && scan->numberOfKeys > 0)
+ 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
+ 
+@@ -318,6 +403,9 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
+ 			so->previousDistance = sc->distance;
+ 		}
+ 
++		if (hnsw_trace_enabled)
++			so->trace.heap_fetch_count++;
++
+ 		MemoryContextSwitchTo(oldCtx);
+ 
+ 		scan->xs_heaptid = *heaptid;
+@@ -338,6 +426,9 @@ hnswendscan(IndexScanDesc scan)
+ {
+ 	HnswScanOpaque so = (HnswScanOpaque) scan->opaque;
+ 
++	if (hnsw_trace_enabled && !so->first)
++		HnswTraceEmit(so, (int) so->trace.heap_fetch_count);
++
+ 	MemoryContextDelete(so->tmpCtx);
+ 
+ 	pfree(so);
+diff --git a/src/hnswutils.c b/src/hnswutils.c
+index 896e66d..39e16b1 100644
+--- a/src/hnswutils.c
++++ b/src/hnswutils.c
+@@ -531,7 +531,7 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
+  * Load an element and optionally get its distance from q
+  */
+ static void
+-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
++HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, HnswTraceStats * trace)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+@@ -555,7 +555,11 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
+ 		if (DatumGetPointer(q->value) == NULL)
+ 			*distance = 0;
+ 		else
++		{
+ 			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
++			if (trace != NULL)
++				trace->distance_compute_count++;
++		}
+ 	}
+ 
+ 	/* Load element */
+@@ -567,6 +571,9 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
+ 		HnswLoadElementFromTuple(*element, etup, true, loadVec);
+ 	}
+ 
++	/* Record element page access for trace */
++	HnswTraceRecordElementPage(trace, blkno);
++
+ 	UnlockReleaseBuffer(buf);
+ }
+ 
+@@ -576,7 +583,7 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
+ void
+ HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
+ {
+-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
++	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, NULL);
+ }
+ 
+ /*
+@@ -617,6 +624,8 @@ HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation i
+ 	else
+ 		HnswLoadElement(entryPoint, &distance, q, index, support, loadVec, NULL);
+ 
++	/* Distance counted inside HnswLoadElement → HnswLoadElementImpl for disk path */
++
+ 	return HnswInitSearchCandidate(base, entryPoint, distance);
+ }
+ 
+@@ -757,7 +766,7 @@ HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unv
+  * Load neighbor index TIDs
+  */
+ bool
+-HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
++HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc, HnswTraceStats * trace)
+ {
+ 	Buffer		buf;
+ 	Page		page;
+@@ -784,6 +793,9 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
+ 	start = (element->level - lc) * m;
+ 	memcpy(indextids, ntup->indextids + start, lm * sizeof(ItemPointerData));
+ 
++	/* Record neighbor page access for trace */
++	HnswTraceRecordNeighborPage(trace, element->neighborPage);
++
+ 	UnlockReleaseBuffer(buf);
+ 	return true;
+ }
+@@ -792,13 +804,13 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
+  * Load unvisited neighbors from disk
+  */
+ static void
+-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
++HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc, HnswTraceStats * trace)
+ {
+ 	ItemPointerData indextids[HNSW_MAX_M * 2];
+ 
+ 	*unvisitedLength = 0;
+ 
+-	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
++	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc, trace))
+ 		return;
+ 
+ 	for (int i = 0; i < lm; i++)
+@@ -820,7 +832,7 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
+  * Algorithm 2 from paper
+  */
+ List *
+-HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
++HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, HnswTraceStats * trace)
+ {
+ 	List	   *w = NIL;
+ 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
+@@ -897,12 +909,15 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 		if (inMemory)
+ 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
+ 		else
+-			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
++			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc, trace);
+ 
+ 		/* OK to count elements instead of tuples */
+ 		if (tuples != NULL)
+ 			(*tuples) += unvisitedLength;
+ 
++		if (trace != NULL)
++			trace->visited_nodes += unvisitedLength;
++
+ 		for (int i = 0; i < unvisitedLength; i++)
+ 		{
+ 			HnswElement eElement;
+@@ -916,6 +931,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 			{
+ 				eElement = unvisited[i].element;
+ 				eDistance = GetElementDistance(base, eElement, q, support);
++				if (trace != NULL)
++					trace->distance_compute_count++;
+ 			}
+ 			else
+ 			{
+@@ -925,7 +942,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
+ 
+ 				/* Avoid any allocations if not adding */
+ 				eElement = NULL;
+-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
++				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement, trace);
+ 
+ 				if (eElement == NULL)
+ 					continue;
+@@ -1303,7 +1320,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+ 	/* 1st phase: greedy search to insert level */
+ 	for (int lc = entryLevel; lc >= level + 1; lc--)
+ 	{
+-		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
++		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
+ 		ep = w;
+ 	}
+ 
+@@ -1322,7 +1339,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
+ 		List	   *lw = NIL;
+ 		ListCell   *lc2;
+ 
+-		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
++		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL, NULL);
+ 
+ 		/* Convert search candidates to candidates */
+ 		foreach(lc2, w)
+-- 
+2.50.1 (Apple Git-155)
+
