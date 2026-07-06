@@ -193,7 +193,7 @@ Embeddings: all-MiniLM-L6-v2 (384-dim, normalized) over title + store + features
 
 Three things silently push the planner off the HNSW index in filtered queries:
 
-1. **The query vector must be a literal**, not a value from a join/subquery. Capture it with `\gset` and inline it as `:'qv'::vector`. With a joined vector the planner falls back to PK lookups + sort.
+1. **The query vector must be a literal**, not a value from a join/subquery. Capture it with `\gset` and inline it as `:'qv'::vector`. With a joined vector the planner falls back to PK lookups + sort. For reproducible benchmarks, **pin the vector to a specific `parent_asin`** — selecting it with `LIKE ... LIMIT 1` (no ORDER BY) is non-deterministic, and a different query vector changes every trace metric (one run visited 3,550 nodes and over-fetched 235 candidates; another vector needed 2,558 and 85).
 2. **The filter must be a plain qual, not a join.** `IN (subquery)` becomes a join and HNSW can't be a join inner. `= ANY((SELECT array_agg(...))::text[])` works — but the PK btree will grab it as an index condition unless sorting is disabled.
 3. **Force the HNSW path** with `SET hnsw.iterative_scan = relaxed_order;` (over-fetch + post-filter) and `SET enable_sort = off;` (blocks the btree + sort plan).
 
@@ -211,11 +211,13 @@ CREATE TEMP TABLE filtered_asins AS
 SELECT parent_asin FROM products_mooncake
 WHERE price IS NOT NULL AND price < 30 AND average_rating >= 4.0;
 
--- Step 2: capture the query vector as a psql variable (becomes a literal)
-SELECT e.embedding AS qv
-FROM products p JOIN product_embeddings e ON p.parent_asin = e.parent_asin
-WHERE lower(p.title) LIKE '%organic moisturizer%'
-LIMIT 1 \gset
+-- Step 2: capture the query vector as a psql variable (becomes a literal).
+-- Pin it to a specific parent_asin so every run uses the same vector —
+-- LIKE ... LIMIT 1 without ORDER BY picks an arbitrary matching row and
+-- makes runs incomparable.
+SELECT embedding AS qv FROM product_embeddings
+WHERE parent_asin = 'B004K4IYMS'   -- "Ultimate Organic Moisturizer Body Gloss"
+\gset
 
 -- Step 3: HNSW iterative scan with the filter as a post-filter qual
 SELECT e.parent_asin, p.title, p.price, p.average_rating,
@@ -228,6 +230,22 @@ LIMIT 10;
 
 DROP TABLE filtered_asins;
 ```
+
+### Pinned vector = reproducible traces
+
+Running the pinned recipe twice in one session (vector `B004K4IYMS`, warm cache):
+
+| Metric | Run 1 | Run 2 |
+|---|---|---|
+| `distance_compute_count` / `visited_nodes` | 2558 | 2558 |
+| `topk` (over-fetch) | 85 | 85 |
+| `index_element_loads` / distinct pages | 2558 / 2448 | 2558 / 2448 |
+| `idx_blks_read` / `heap_blks_read` | 0 / 0 | 0 / 0 |
+| `topk_ids` | identical | identical |
+| `latency_ms` | 26.9 | 24.1 |
+| `hnsw_search_ms` / `heap_fetch_ms` | 8.4 / 18.5 | 6.3 / 17.8 |
+
+All work metrics and the returned TID list are deterministic; only wall-clock timing jitters. This is the paired-comparison baseline `query_id` exists for — change one variable (ef_search, index params, cache state) and any metric difference is attributable to it. Note also: on a warm index the executor side dominates (`heap_fetch_ms` ≈ 3x `hnsw_search_ms`) — that's the per-row `= ANY(9,690-element array)` filter cost, which cold-cache runs hide under I/O.
 
 ### Example 1: "organic moisturizer" + price < $30, rating >= 4.0
 
